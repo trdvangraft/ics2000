@@ -1,5 +1,3 @@
-
-
 Example usage:
 ```Python
 hub = get_hub("Mac address of ics2000", "email", "password")
