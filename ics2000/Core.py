@@ -1,13 +1,16 @@
 import enum
+from ics2000.Cryptographer import decrypt
+from ics2000.settings import BASE_URL
+from ics2000.TrustEnconder import TrustEnconder
+from ics2000.Room import Room
+from typing import List
 import requests
 import json
 import ast
 
-from ics2000.Command import *
 from ics2000.Devices import *
 
-base_url = "https://trustsmartcloud2.com/ics2000_api/"
-
+from deepdiff import DeepDiff
 
 def constraint_int(inp, min_val, max_val) -> int:
     if inp < min_val:
@@ -29,13 +32,15 @@ class Hub:
         self._password = password
         self._connected = False
         self._homeId = -1
-        self._devices = []
+        self._devices : List[Device] = []
+        self._rooms : List[Room] = []
         self.loginuser()
         self.pulldevices()
+        self.get_my_devices()
 
     def loginuser(self):
         print("Logging in user")
-        url = base_url + "/account.php"
+        url = BASE_URL + "/account.php"
         params = {"action": "login", "email": self._email, "mac": self.mac.replace(":", ""),
                   "password_hash": self._password, "device_unique_id": "android", "platform": "Android"}
         req = requests.get(url, params=params)
@@ -51,13 +56,17 @@ class Hub:
         return self._connected
 
     def pulldevices(self):
-        url = base_url + "/gateway.php"
+        url = BASE_URL + "/gateway.php"
         params = {"action": "sync", "email": self._email, "mac": self.mac.replace(":", ""),
                   "password_hash": self._password, "home_id": self._homeId}
         resp = requests.get(url, params=params)
         self._devices = []
-        for device in json.loads(resp.text):
-            decrypted = json.loads(decrypt(device["data"], self.aes))
+        self._rooms = []
+
+        devices = json.loads(resp.text)
+        decrypted_devices = [json.loads(decrypt(device["data"], self.aes)) for device in devices]
+
+        for decrypted in decrypted_devices:
             if "module" in decrypted and "info" in decrypted["module"]:
                 decrypted = decrypted["module"]
                 name = decrypted["name"]
@@ -66,7 +75,7 @@ class Hub:
                 devices = [item.value for item in DeviceType]
                 if decrypted["device"] not in devices:
                     self._devices.append(Device(name, entityid, self))
-                    return
+                    continue
                 dev = DeviceType(decrypted["device"])
                 if dev == DeviceType.LAMP:
                     self._devices.append(Device(name, entityid, self))
@@ -74,44 +83,22 @@ class Hub:
                     self._devices.append(Dimmer(name, entityid, self))
                 if dev == DeviceType.OPENCLOSE:
                     self._devices.append(Device(name, entityid, self))
+                if dev == DeviceType.ZIGBEEZLL:
+                    info, additional_info, module_info = decrypted["info"], decrypted["additional_info"], decrypted["extended_module_info"]
+                    self._devices.append(ZigbeeZll(name, entityid, self, info, additional_info, module_info))
+            elif "room" in decrypted:
+                decrypted = decrypted["room"]
+                name = decrypted["name"]
+                entityid = decrypted["id"]
+                modules = decrypted["modules"]
+                self._rooms.append(Room(entityid, self, name, modules))
+
 
     def devices(self):
         return self._devices
 
-    def sendcommand(self, command):
-        url = base_url + "/command.php"
-        params = {"action": "add", "email": self._email, "mac": self.mac.replace(":", ""),
-                  "password_hash": self._password, "device_unique_id": "android", "command": command}
-        requests.get(url, params=params)
-
-    def turnoff(self, entity):
-        cmd = self.simplecmd(entity, 0, 0)
-        self.sendcommand(cmd.getcommand())
-
-    def turnon(self, entity):
-        cmd = self.simplecmd(entity, 0, 1)
-        self.sendcommand(cmd.getcommand())
-
-    def dim(self, entity, level):
-        cmd = self.simplecmd(entity, 1, level)
-        self.sendcommand(cmd.getcommand())
-
-    def zigbee_color_temp(self, entity, color_temp):
-        color_temp = constraint_int(color_temp, 0, 600)
-        cmd = self.simplecmd(entity, 9, color_temp)
-        self.sendcommand(cmd.getcommand())
-
-    def zigbee_dim(self, entity, dim_lvl):
-        dim_lvl = constraint_int(dim_lvl, 1, 254)
-        cmd = self.simplecmd(entity, 4, dim_lvl)
-        self.sendcommand(cmd.getcommand())
-
-    def zigbee_switch(self, entity, power):
-        cmd = self.simplecmd(entity, 3, (str(1) if power else str(0)))
-        self.sendcommand(cmd.getcommand())
-
     def get_device_status(self, entity) -> []:
-        url = base_url + "/entity.php"
+        url = BASE_URL + "/entity.php"
         params = {"action": "get-multiple", "email": self._email, "mac": self.mac.replace(":", ""),
                   "password_hash": self._password, "home_id": self._homeId, "entity_id": "[" + str(entity) + "]"}
         resp = requests.get(url, params=params)
@@ -129,26 +116,38 @@ class Hub:
             return True if status[0] == 1 else False
         return False
 
-    def simplecmd(self, entity, function, value):
-        cmd = Command()
-        cmd.setmac(self.mac)
-        cmd.settype(128)
-        cmd.setmagic()
-        cmd.setentityid(entity)
-        cmd.setdata(
-            "{\"module\":{\"id\":" + str(entity) + ",\"function\":" + str(function) + ",\"value\":" + str(value) + "}}",
-            self.aes)
-        return cmd
+    
 
+    def get_my_devices(self):
+        my_room : Room = next(filter(lambda room : room._name == "Tijmen", self._rooms))
+        my_modules = my_room._devices
+        my_devices = [device for device in self._devices if device._id in my_modules]
+
+        result = [my_room] + my_devices
+
+        FILE_NAME = "light_on_red"
+
+        with open(f"{FILE_NAME}.json", "w") as f:
+            json.dump(result, f, indent=4, cls=TrustEnconder)
+
+        with open("baseline.json", "r") as r:
+            baseline = json.load(r)
+
+        with open(f"{FILE_NAME}.json", "r") as r:
+            test = json.load(r)
+
+        diff = DeepDiff(baseline, test)
+        print(diff)
 
 class DeviceType(enum.Enum):
     LAMP = 1
     DIMMER = 2
     OPENCLOSE = 3
+    ZIGBEEZLL = 40
 
 
 def get_hub(mac, email, password) -> Optional[Hub]:
-    url = base_url + "/gateway.php"
+    url = BASE_URL + "/gateway.php"
     params = {"action": "check", "email": email, "mac": mac.replace(":", ""), "password_hash": password}
     resp = requests.get(url, params=params)
     if resp.status_code == 200:
